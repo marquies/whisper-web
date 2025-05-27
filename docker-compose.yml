@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  whisper-app:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount temp directory for better performance
+      - ./temp:/tmp/uploads
+      # Optional: Mount for model caching (speeds up restarts)
+      - ./model_cache:/root/.cache/huggingface
+    device_requests:
+      - capabilities: [gpu]
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Optional: Limit resources
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G

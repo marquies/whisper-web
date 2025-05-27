@@ -163,7 +163,8 @@ def transcribe_audio(audio_file, simple_mode, task_id):
                 torch_dtype=torch.float32,  # Try with float32 for better stability
                 device=device,
             )
-            result = pipe_fallback(audio_file, generate_kwargs={"language": "<|en|>", "task": "transcribe"})
+            # Use the same generate_kwargs without attention_mask
+            result = pipe_fallback(audio_file, generate_kwargs=generate_kwargs)
         except Exception as fallback_error:
             # If fallback also fails, log and raise a more specific error
             print(f"Fallback also failed: {str(fallback_error)}")

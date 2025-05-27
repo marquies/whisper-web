@@ -74,61 +74,191 @@ def extract_audio(video_file, audio_file, task_id):
 
 def transcribe_audio(audio_file, simple_mode, task_id):
     """Transcribe audio file using Whisper"""
-    global pipe
+    global pipe, model, processor
 
     progress_data[task_id] = {"stage": "transcribing", "progress": 50}
+    
+    # Get audio file size
+    file_size = os.path.getsize(audio_file) / (1024 * 1024)  # Size in MB
+    
+    # For large files, use more conservative settings
+    chunk_length = 30
+    batch_size = 8
+    if file_size > 50:  # If file is larger than 50MB
+        chunk_length = 15
+        batch_size = 4
+    elif file_size > 100:  # If file is larger than 100MB
+        chunk_length = 10
+        batch_size = 2
+        
+    # Clear GPU cache before processing
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     try:
-        if simple_mode:
-            result = pipe(audio_file)
-        else:
-            result = pipe(audio_file, return_timestamps=True)
-    except ValueError:
-        # Fallback pipeline configuration
-        print("Go fallback")
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        
+        # Set attention mask explicitly to avoid warning
+        generate_kwargs = {
+            "language": "<|en|>", 
+            "task": "transcribe",
+            "attention_mask": None  # Will be set by the pipeline
+        }
+        
+        if simple_mode:
+            # Create a new pipeline with dynamic settings for simple mode
+            pipe_simple = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                max_new_tokens=128,
+                chunk_length_s=chunk_length,
+                batch_size=batch_size,
+                return_timestamps=False,
+                torch_dtype=torch_dtype,
+                device=device,
+            )
+            result = pipe_simple(audio_file, generate_kwargs=generate_kwargs)
+        else:
+            # Create a new pipeline with timestamps and dynamic settings
+            pipe_timestamps = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                max_new_tokens=128,
+                chunk_length_s=chunk_length,
+                batch_size=batch_size,
+                return_timestamps=True,
+                torch_dtype=torch_dtype,
+                device=device,
+            )
+            result = pipe_timestamps(audio_file, generate_kwargs=generate_kwargs)
 
-        pipe_fallback = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            max_new_tokens=128,
-            chunk_length_s=30,
-            batch_size=8,  # Reduced from 16 to save memory
-            return_timestamps=not simple_mode,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
-        result = pipe_fallback(audio_file, generate_kwargs={"language": "<|en|>", "task": "transcribe"})
+    except ValueError as e:
+        # Log the error
+        print(f"Pipeline error, trying fallback: {str(e)}")
+        
+        # Clear GPU cache before fallback
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        try:
+            # Use even more conservative settings for fallback
+            fallback_chunk_length = max(5, chunk_length // 2)
+            fallback_batch_size = max(1, batch_size // 2)
+            
+            # Create a fallback pipeline with minimal settings
+            pipe_fallback = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                max_new_tokens=64,  # Reduced tokens
+                chunk_length_s=fallback_chunk_length,
+                batch_size=fallback_batch_size,
+                return_timestamps=not simple_mode,
+                torch_dtype=torch.float32,  # Try with float32 for better stability
+                device=device,
+            )
+            result = pipe_fallback(audio_file, generate_kwargs={"language": "<|en|>", "task": "transcribe"})
+        except Exception as fallback_error:
+            # If fallback also fails, log and raise a more specific error
+            print(f"Fallback also failed: {str(fallback_error)}")
+            raise RuntimeError(f"Transcription failed: {str(e)}. Fallback also failed: {str(fallback_error)}")
 
     progress_data[task_id] = {"stage": "completed", "progress": 100}
     return result
 
 def process_file_async(file_path, simple_mode, task_id):
     """Process file asynchronously"""
+    audio_file = None
     try:
-        # Generate temporary audio file path
-        audio_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
-
-        # Extract audio
-        extract_audio(file_path, audio_file, task_id)
+        # Check file size first
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+        print(f"Processing file of size: {file_size_mb:.2f} MB")
+        
+        if file_size_mb > 500:  # Warn for very large files
+            print(f"Warning: Large file ({file_size_mb:.2f} MB) may require significant resources")
+            # Update progress to indicate large file processing
+            progress_data[task_id] = {"stage": "preparing", "progress": 5, "message": "Large file detected, optimizing processing..."}
+            
+        # Clear memory before processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Check file extension to handle different audio formats
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        # Special handling for AIFC/AIFF files
+        if file_ext in ['.aifc', '.aiff']:
+            # Convert AIFC/AIFF to WAV for better compatibility
+            audio_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.wav")
+            progress_data[task_id] = {"stage": "extracting", "progress": 10, "message": "Converting AIFC/AIFF format..."}
+            
+            try:
+                # Use special extraction for AIFC files with error handling
+                command = ["ffmpeg", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "16000", audio_file, "-y"]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+                if result.returncode != 0:
+                    error_msg = f"FFmpeg error: {result.stderr}"
+                    print(error_msg)
+                    raise RuntimeError(error_msg)
+                progress_data[task_id] = {"stage": "extracted", "progress": 30}
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("FFmpeg timed out while processing the audio file")
+        else:
+            # For other files, use standard extraction
+            audio_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
+            extract_audio(file_path, audio_file, task_id)
 
         # Transcribe
         result = transcribe_audio(audio_file, simple_mode, task_id)
 
         # Clean up
-        if os.path.exists(audio_file):
+        if audio_file and os.path.exists(audio_file) and audio_file != file_path:
             os.remove(audio_file)
         if os.path.exists(file_path):
             os.remove(file_path)
 
+        # Final memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         # Store result
         progress_data[task_id]["result"] = result
 
+    except (RuntimeError, ValueError, OSError) as e:
+        error_msg = f"Error processing file: {str(e)}"
+        print(error_msg)
+        progress_data[task_id] = {"stage": "error", "progress": 0, "error": error_msg}
+        
+        # Cleanup on error
+        if audio_file and os.path.exists(audio_file) and audio_file != file_path:
+            try:
+                os.remove(audio_file)
+            except OSError:
+                pass
+                
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception as e:
-        progress_data[task_id] = {"stage": "error", "progress": 0, "error": str(e)}
+        # Catch any other unexpected errors
+        error_msg = f"Unexpected error: {str(e)}"
+        print(error_msg)
+        progress_data[task_id] = {"stage": "error", "progress": 0, "error": error_msg}
+        
+        # Cleanup on error
+        if audio_file and os.path.exists(audio_file) and audio_file != file_path:
+            try:
+                os.remove(audio_file)
+            except OSError:
+                pass
+                
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 @app.route('/')
 def index():
@@ -416,7 +546,7 @@ HTML_TEMPLATE = '''
 </head>
 <body>
     <div class="container">
-        <h1>🎤 Whisper Transkription v2</h1>
+        <h1>🎤 Whisper Transkription</h1>
 
         <div class="upload-section">
             <div class="file-input-wrapper">

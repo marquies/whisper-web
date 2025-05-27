@@ -99,11 +99,11 @@ def transcribe_audio(audio_file, simple_mode, task_id):
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
-        # Set attention mask explicitly to avoid warning
+        # Set generation parameters
         generate_kwargs = {
             "language": "<|en|>", 
-            "task": "transcribe",
-            "attention_mask": None  # Will be set by the pipeline
+            "task": "transcribe"
+            # Let the pipeline handle attention_mask automatically
         }
         
         if simple_mode:

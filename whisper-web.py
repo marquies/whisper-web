@@ -103,7 +103,7 @@ def transcribe_audio(audio_file, simple_mode, task_id):
         print("starting cormal operation")
         # Set generation parameters
         generate_kwargs = {
-            "language": "<|en|>", 
+        #    "language": "<|en|>", 
             "task": "transcribe"
             # Let the pipeline handle attention_mask automatically
         }

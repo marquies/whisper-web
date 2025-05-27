@@ -416,11 +416,11 @@ HTML_TEMPLATE = '''
 </head>
 <body>
     <div class="container">
-        <h1>🎤 Whisper Transkription</h1>
+        <h1>🎤 Whisper Transkription v2</h1>
 
         <div class="upload-section">
             <div class="file-input-wrapper">
-                <input type="file" id="fileInput" class="file-input" accept="audio/*,video/*">
+                <input type="file" id="fileInput" class="file-input" accept="audio/*,video/*,.aifc,.aiff">
                 <label for="fileInput" class="file-input-button">
                     📁 Audio/Video Datei auswählen
                 </label>

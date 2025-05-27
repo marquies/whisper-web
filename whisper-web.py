@@ -98,7 +98,7 @@ def transcribe_audio(audio_file, simple_mode, task_id):
     try:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        
+        print("starting cormal operation")
         # Set generation parameters
         generate_kwargs = {
             "language": "<|en|>", 
@@ -106,6 +106,7 @@ def transcribe_audio(audio_file, simple_mode, task_id):
             # Let the pipeline handle attention_mask automatically
         }
         
+        print("simple mode: ", simple_mode)
         if simple_mode:
             # Create a new pipeline with dynamic settings for simple mode
             pipe_simple = pipeline(
@@ -245,21 +246,21 @@ def process_file_async(file_path, simple_mode, task_id):
                 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception as e:
-        # Catch any other unexpected errors
-        error_msg = f"Unexpected error: {str(e)}"
-        print(error_msg)
-        progress_data[task_id] = {"stage": "error", "progress": 0, "error": error_msg}
-        
-        # Cleanup on error
-        if audio_file and os.path.exists(audio_file) and audio_file != file_path:
-            try:
-                os.remove(audio_file)
-            except OSError:
-                pass
-                
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    #except Exception as e:
+    #    # Catch any other unexpected errors
+    #    error_msg = f"Unexpected error: {str(e)}"
+    #    print(error_msg)
+    #    progress_data[task_id] = {"stage": "error", "progress": 0, "error": error_msg}
+    #    
+    #    # Cleanup on error
+    #    if audio_file and os.path.exists(audio_file) and audio_file != file_path:
+    #        try:
+    #            os.remove(audio_file)
+    #        except OSError:
+    #            pass
+    #            
+    #    if torch.cuda.is_available():
+    #        torch.cuda.empty_cache()
 
 @app.route('/')
 def index():

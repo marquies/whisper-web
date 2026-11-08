@@ -10,56 +10,71 @@ import uuid
 from werkzeug.utils import secure_filename
 import threading
 import time
+import gc
+import traceback
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
 
-# Global variables for model (load once)
-model = None
-processor = None
-pipe = None
+# Serialize GPU work: the model is loaded per request, so concurrent requests
+# would otherwise each load their own copy and exhaust GPU memory.
+gpu_lock = threading.Lock()
 
 # Progress tracking
 progress_data = {}
 
+MODEL_ID = "openai/whisper-large-v3"
+
+
 def load_whisper_model():
-    """Load Whisper model once at startup"""
-    global model, processor, pipe
-
+    """Load the Whisper model and processor. Called per request; weights come from the local HF cache."""
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print("Device: ", device, "CUDA?", torch.cuda.is_available())
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model_id = "openai/whisper-large-v3"
+    print(f"Loading Whisper model on {device}...")
 
-    print("Loading Whisper model...")
-    
-    # Clear GPU cache before loading
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
+        MODEL_ID, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
     )
     model.to(device)
-    processor = AutoProcessor.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        max_new_tokens=128,
-        chunk_length_s=30,
-        batch_size=8,  # Reduced from 16 to save memory
-        torch_dtype=torch_dtype,
-        device=device,
-    )
-    
-    # Clear cache again after loading
+    print("Model loaded.")
+    return model, processor
+
+
+def release_gpu_memory():
+    """Free unreferenced tensors and return cached GPU memory to the driver."""
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
-    print("Model loaded successfully!")
+        torch.cuda.ipc_collect()
+        print(f"GPU memory after release: allocated={torch.cuda.memory_allocated() / 2**20:.0f} MiB, "
+              f"reserved={torch.cuda.memory_reserved() / 2**20:.0f} MiB")
+
+
+def run_transcription(audio_file, simple_mode, task_id):
+    """Load the model, transcribe, and unload the model again - even on failure."""
+    progress_data[task_id] = {"stage": "queued", "progress": 35}
+    with gpu_lock:
+        progress_data[task_id] = {"stage": "loading_model", "progress": 40}
+        model = processor = None
+        result = None
+        error_msg = None
+        try:
+            model, processor = load_whisper_model()
+            result = transcribe_audio(audio_file, simple_mode, task_id, model, processor)
+        except Exception as e:  # pylint: disable=broad-except
+            # Keep only the message: holding the exception/traceback would keep
+            # the model referenced via stack frames and block the memory release.
+            traceback.print_exc()
+            error_msg = f"{type(e).__name__}: {e}"
+        finally:
+            model = processor = None
+            release_gpu_memory()
+
+    if error_msg is not None:
+        raise RuntimeError(error_msg)
+    return result
 
 def extract_audio(video_file, audio_file, task_id):
     """Extract audio from video file using FFmpeg"""
@@ -73,9 +88,8 @@ def extract_audio(video_file, audio_file, task_id):
 
     progress_data[task_id] = {"stage": "extracted", "progress": 30}
 
-def transcribe_audio(audio_file, simple_mode, task_id):
+def transcribe_audio(audio_file, simple_mode, task_id, model, processor):
     """Transcribe audio file using Whisper"""
-    global pipe, model, processor
 
     progress_data[task_id] = {"stage": "transcribing", "progress": 50}
     
@@ -218,7 +232,7 @@ def process_file_async(file_path, simple_mode, task_id):
             extract_audio(file_path, audio_file, task_id)
 
         # Transcribe
-        result = transcribe_audio(audio_file, simple_mode, task_id)
+        result = run_transcription(audio_file, simple_mode, task_id)
 
         # Clean up
         if audio_file and os.path.exists(audio_file) and audio_file != file_path:
@@ -676,6 +690,8 @@ HTML_TEMPLATE = '''
                         'uploaded': 'Datei hochgeladen...',
                         'extracting': 'Audio wird extrahiert...',
                         'extracted': 'Audio extrahiert...',
+                        'queued': 'Warte auf freie GPU...',
+                        'loading_model': 'Modell wird geladen...',
                         'transcribing': 'Transkription läuft...',
                         'completed': 'Verarbeitung abgeschlossen!',
                         'error': 'Fehler aufgetreten'
@@ -789,7 +805,6 @@ HTML_TEMPLATE = '''
 
 if __name__ == '__main__':
     print("Starting Whisper Transcription Server...")
-    print("Loading model (this may take a few minutes)...")
-    load_whisper_model()
+    print("Whisper model is loaded per request and released afterwards.")
     print("Server starting on http://localhost:5000")
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True, use_reloader=False)

@@ -1,7 +1,10 @@
 # app.py - Main Flask Application
 from flask import Flask, request, jsonify, render_template_string
-import torch
 import os
+# Must be set before CUDA is initialised: lets empty_cache() return memory even when a few small
+# tensors survive, instead of a whole large block staying reserved.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import torch
 import tempfile
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 import json
@@ -12,6 +15,15 @@ import threading
 import time
 import gc
 import traceback
+import base64
+import glob
+import re
+import shutil
+import urllib.request
+import urllib.error
+import wave
+
+import numpy as np
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
@@ -24,6 +36,35 @@ gpu_lock = threading.Lock()
 progress_data = {}
 
 MODEL_ID = "openai/whisper-large-v3"
+
+# Alternative engine: Qwen3-ASR served by Ollama
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.containers.internal:11434").rstrip("/")
+QWEN_ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "frozenlab/qwen3-asr:1.7b")
+QWEN_ASR_CHUNK_S = int(os.environ.get("QWEN_ASR_CHUNK_S", "30"))  # model accepts <= ~60 s per request
+QWEN_ASR_TIMEOUT_S = int(os.environ.get("QWEN_ASR_TIMEOUT_S", "300"))
+
+# Alternative engine: Microsoft VibeVoice-ASR (transcription + speaker diarization in one model)
+VIBEVOICE_MODEL_ID = os.environ.get("VIBEVOICE_MODEL_ID", "microsoft/VibeVoice-ASR-HF")
+VIBEVOICE_SAMPLE_RATE = 24000
+VIBEVOICE_MAX_PART_S = int(os.environ.get("VIBEVOICE_MAX_PART_S", "2700"))  # 45 min tested on 24 GB (peak 23.2 GB); model limit is 60 min
+
+# GPU memory needed before loading a local model; Ollama models are unloaded to make room if necessary
+WHISPER_MIN_FREE_GB = float(os.environ.get("WHISPER_MIN_FREE_GB", "6"))
+VIBEVOICE_MIN_FREE_GB = float(os.environ.get("VIBEVOICE_MIN_FREE_GB", "20"))
+OLLAMA_UNLOAD_FOR_GPU = os.environ.get("OLLAMA_UNLOAD_FOR_GPU", "true").lower() == "true"
+
+# Alternative engine: Whisper + pyannote speaker diarization (gated model: needs a Hugging Face token)
+DIARIZATION_MODEL_ID = os.environ.get("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-community-1")
+WHISPER_PYANNOTE_MIN_FREE_GB = float(os.environ.get("WHISPER_PYANNOTE_MIN_FREE_GB", "8"))
+WHISPER_PYANNOTE_BATCH = int(os.environ.get("WHISPER_PYANNOTE_BATCH", "8"))
+
+ENGINES = ("whisper", "qwen3-asr", "vibevoice", "whisper-pyannote")
+
+# Post-processing (minutes / action items) with an LLM served by Ollama
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4:31b")
+LLM_MAX_CTX = int(os.environ.get("LLM_MAX_CTX", "32768"))
+LLM_TIMEOUT_S = int(os.environ.get("LLM_TIMEOUT_S", "900"))
+ANALYSES = ("minutes", "actions")
 
 
 def load_whisper_model():
@@ -46,30 +87,271 @@ def release_gpu_memory():
     """Free unreferenced tensors and return cached GPU memory to the driver."""
     gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        # The cuBLAS workspace lives in the caching allocator and pins its memory block otherwise
+        torch._C._cuda_clearCublasWorkspaces()  # pylint: disable=protected-access
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         print(f"GPU memory after release: allocated={torch.cuda.memory_allocated() / 2**20:.0f} MiB, "
               f"reserved={torch.cuda.memory_reserved() / 2**20:.0f} MiB")
 
 
-def run_transcription(audio_file, simple_mode, task_id):
+def _model_key(name):
+    return name if ":" in name.split("/")[-1] else f"{name}:latest"
+
+
+def unload_ollama_models(keep=None):
+    """Unload every model Ollama holds, except `keep`, so only one model uses the GPU at a time.
+    Waits until Ollama reports them gone. Call with gpu_lock held."""
+    if not OLLAMA_UNLOAD_FOR_GPU:
+        return
+    try:
+        loaded = _ollama_get("/api/ps").get("models", [])
+    except RuntimeError as e:
+        print(f"Could not query Ollama: {e}")
+        return
+    to_unload = [m["name"] for m in loaded if not keep or _model_key(m["name"]) != _model_key(keep)]
+    for name in to_unload:
+        print(f"Unloading Ollama model {name} (one model at a time)")
+        _ollama_post("/api/generate", {"model": name, "keep_alive": 0}, 60)
+    for _ in range(60):
+        if not to_unload:
+            return
+        still = {m["name"] for m in _ollama_get("/api/ps").get("models", [])}
+        to_unload = [n for n in to_unload if n in still]
+        time.sleep(1)
+
+
+def ensure_gpu_memory(min_free_gb, task_id):
+    """Unload all Ollama models, then make sure enough GPU memory is free. Call with gpu_lock held."""
+    if not torch.cuda.is_available():
+        return
+    progress_data[task_id] = {"stage": "freeing_gpu", "progress": 38}
+    unload_ollama_models()
+
+    for _ in range(60):
+        free_gb = torch.cuda.mem_get_info()[0] / 2**30
+        if free_gb >= min_free_gb:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"Not enough free GPU memory: {free_gb:.1f} GB free, {min_free_gb:.0f} GB needed")
+
+
+def load_vibevoice_model():
+    from transformers import VibeVoiceAsrForConditionalGeneration  # needs transformers >= 5.3
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    print(f"Loading VibeVoice-ASR on {device}...")
+    processor = AutoProcessor.from_pretrained(VIBEVOICE_MODEL_ID)
+    model = VibeVoiceAsrForConditionalGeneration.from_pretrained(VIBEVOICE_MODEL_ID, dtype=dtype, device_map=device)
+    model.eval()
+    print("VibeVoice-ASR loaded.")
+    return model, processor
+
+
+def _load_audio_array(audio_file, sample_rate):
+    """Decode any audio/video file to a mono float32 numpy array via FFmpeg."""
+    command = ["ffmpeg", "-nostdin", "-i", audio_file, "-vn", "-ac", "1", "-ar", str(sample_rate),
+               "-f", "f32le", "-"]
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg error: {result.stderr.decode('utf-8', 'replace')}")
+    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    if audio.size == 0:
+        raise RuntimeError("No audio found in file")
+    return audio
+
+
+def _parse_vibevoice_output(raw):
+    """Parse '[{"Start":..,"End":..,"Speaker":..,"Content":..}, ...]', salvaging complete segments if truncated."""
+    text = raw.strip()
+    if text.startswith("assistant"):
+        text = text[len("assistant"):].strip()
+    try:
+        segments = json.loads(text[text.index("["):])
+        if isinstance(segments, list):
+            return [seg for seg in segments if isinstance(seg, dict) and "Content" in seg]
+    except ValueError:
+        pass
+    segments = []
+    for match in re.finditer(r"\{[^{}]*\}", text):
+        try:
+            seg = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if isinstance(seg, dict) and "Content" in seg:
+            segments.append(seg)
+    if not segments and text:
+        print(f"Unparseable VibeVoice output: {text[:500]}")
+    return segments
+
+
+def transcribe_vibevoice(audio_file, simple_mode, task_id, model, processor, context=""):
+    """Transcribe with speaker labels. Audio longer than VIBEVOICE_MAX_PART_S is processed in parts."""
+    audio = _load_audio_array(audio_file, VIBEVOICE_SAMPLE_RATE)
+    part_len = VIBEVOICE_MAX_PART_S * VIBEVOICE_SAMPLE_RATE
+    parts = [audio[i:i + part_len] for i in range(0, len(audio), part_len)]
+
+    chunks = []
+    for p, part in enumerate(parts):
+        progress_data[task_id] = {"stage": "transcribing", "progress": 50 + int(45 * p / len(parts)),
+                                  "message": f"Teil {p + 1}/{len(parts)}" if len(parts) > 1 else ""}
+        duration = len(part) / VIBEVOICE_SAMPLE_RATE
+        offset = p * VIBEVOICE_MAX_PART_S
+        inputs = processor.apply_transcription_request(audio=part, prompt=context or None)
+        inputs = inputs.to(model.device, model.dtype)
+        # ~3-4 text tokens per second of speech plus JSON overhead per segment
+        max_new_tokens = min(40000, int(duration * 10) + 512)
+        with torch.inference_mode():
+            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        generated = output_ids[:, inputs["input_ids"].shape[1]:]
+        raw = processor.decode(generated, skip_special_tokens=True)[0]
+        del inputs, output_ids, generated
+
+        for seg in _parse_vibevoice_output(raw):
+            content = str(seg.get("Content", "")).strip()
+            if not content:
+                continue
+            spk = int(seg.get("Speaker", 0)) + 1
+            # Speaker numbers are only consistent within one part
+            speaker = f"Sprecher {spk}" if len(parts) == 1 else f"Sprecher {p + 1}.{spk}"
+            start = float(seg.get("Start", 0) or 0) + offset
+            end = float(seg.get("End", start - offset) or 0) + offset
+            chunks.append({"timestamp": [round(start, 2), round(end, 2)], "speaker": speaker, "text": content})
+
+    progress_data[task_id] = {"stage": "completed", "progress": 100}
+    return _speaker_result(chunks, simple_mode)
+
+
+def _speaker_result(chunks, simple_mode):
+    """Result format for engines with speaker labels ("Sprecher N" or "Sprecher P.N")."""
+    speakers = sorted({c["speaker"] for c in chunks}, key=lambda x: [float(n) for n in x.split()[1].split(".")])
+    text = "\n".join(f"{c['speaker']}: {c['text']}" for c in chunks)
+    result = {"text": text, "speakers": speakers}
+    if not simple_mode:
+        result["chunks"] = chunks
+    return result
+
+
+def load_diarization_pipeline():
+    from pyannote.audio import Pipeline  # imported lazily: heavy import, only needed for this engine
+    print(f"Loading diarization pipeline {DIARIZATION_MODEL_ID}...")
+    try:
+        diarization = Pipeline.from_pretrained(DIARIZATION_MODEL_ID, token=os.environ.get("HF_TOKEN"))
+    except Exception as e:  # pylint: disable=broad-except
+        raise RuntimeError(
+            f"Could not load {DIARIZATION_MODEL_ID}: {e}. The model is gated: accept its terms on "
+            f"https://huggingface.co/{DIARIZATION_MODEL_ID} and provide a Hugging Face token "
+            "(HF_TOKEN or a token file in the mounted Hugging Face cache)."
+        ) from None
+    if diarization is None:
+        raise RuntimeError(f"Could not load {DIARIZATION_MODEL_ID}: access denied or missing token")
+    if torch.cuda.is_available():
+        diarization.to(torch.device("cuda:0"))
+    return diarization
+
+
+def _diarize(diarization, audio):
+    """Return sorted (start, end, label) turns without overlaps, labels renamed to 'Sprecher N'."""
+    output = diarization({"waveform": torch.from_numpy(audio.copy()).unsqueeze(0), "sample_rate": 16000})
+    # pyannote 4 returns an object with an overlap-free variant, which is what transcript alignment needs
+    annotation = getattr(output, "exclusive_speaker_diarization", None) or getattr(output, "speaker_diarization", output)
+    turns, names = [], {}
+    for turn, _, label in sorted(annotation.itertracks(yield_label=True), key=lambda t: t[0].start):
+        if label not in names:
+            names[label] = f"Sprecher {len(names) + 1}"
+        turns.append((turn.start, turn.end, names[label]))
+    return turns
+
+
+def _turn_pieces(turns, max_len=28.0, max_gap=1.0, min_len=0.3):
+    """Merge consecutive turns of the same speaker and cut them into Whisper-sized pieces (<= max_len seconds)."""
+    merged = []
+    for start, end, speaker in turns:
+        last = merged[-1] if merged else None
+        if last and last[2] == speaker and start - last[1] <= max_gap and end - last[0] <= max_len:
+            last[1] = end
+        else:
+            merged.append([start, end, speaker])
+    pieces = []
+    for start, end, speaker in merged:
+        while end - start > max_len:
+            pieces.append((start, start + max_len, speaker))
+            start += max_len
+        if end - start >= min_len:
+            pieces.append((start, end, speaker))
+    return pieces
+
+
+def transcribe_whisper_pyannote(audio_file, simple_mode, task_id, model, processor, diarization):
+    """pyannote finds the speaker turns; Whisper transcribes the turn pieces in batches (as WhisperX does)."""
+    audio = _load_audio_array(audio_file, 16000)
+
+    progress_data[task_id] = {"stage": "diarizing", "progress": 45}
+    pieces = _turn_pieces(_diarize(diarization, audio))
+
+    progress_data[task_id] = {"stage": "transcribing", "progress": 60}
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        device=device,
+    )
+    inputs = [{"raw": audio[int(a * 16000):int(b * 16000)], "sampling_rate": 16000} for a, b, _ in pieces]
+    # Language is detected per piece, which handles meetings switching between German and English
+    outputs = pipe(inputs, batch_size=WHISPER_PYANNOTE_BATCH, generate_kwargs={"task": "transcribe"}) if inputs else []
+    del pipe
+
+    chunks = []
+    for (start, end, speaker), out in zip(pieces, outputs):
+        text = out.get("text", "").strip()
+        if not text:
+            continue
+        last = chunks[-1] if chunks else None
+        if last and last["speaker"] == speaker:
+            last["text"] += " " + text
+            last["timestamp"][1] = round(end, 2)
+        else:
+            chunks.append({"timestamp": [round(start, 2), round(end, 2)], "speaker": speaker, "text": text})
+
+    progress_data[task_id] = {"stage": "completed", "progress": 100}
+    return _speaker_result(chunks, simple_mode)
+
+
+def run_transcription(audio_file, simple_mode, task_id, engine="whisper", context=""):
     """Load the model, transcribe, and unload the model again - even on failure."""
     progress_data[task_id] = {"stage": "queued", "progress": 35}
     with gpu_lock:
-        progress_data[task_id] = {"stage": "loading_model", "progress": 40}
-        model = processor = None
+        model = processor = diarization = None
         result = None
         error_msg = None
         try:
-            model, processor = load_whisper_model()
-            result = transcribe_audio(audio_file, simple_mode, task_id, model, processor)
+            if engine == "vibevoice":
+                ensure_gpu_memory(VIBEVOICE_MIN_FREE_GB, task_id)
+                progress_data[task_id] = {"stage": "loading_model", "progress": 40}
+                model, processor = load_vibevoice_model()
+                result = transcribe_vibevoice(audio_file, simple_mode, task_id, model, processor, context)
+            elif engine == "whisper-pyannote":
+                ensure_gpu_memory(WHISPER_PYANNOTE_MIN_FREE_GB, task_id)
+                progress_data[task_id] = {"stage": "loading_model", "progress": 40}
+                diarization = load_diarization_pipeline()
+                model, processor = load_whisper_model()
+                result = transcribe_whisper_pyannote(audio_file, simple_mode, task_id, model, processor,
+                                                     diarization)
+            else:
+                ensure_gpu_memory(WHISPER_MIN_FREE_GB, task_id)
+                progress_data[task_id] = {"stage": "loading_model", "progress": 40}
+                model, processor = load_whisper_model()
+                result = transcribe_audio(audio_file, simple_mode, task_id, model, processor)
         except Exception as e:  # pylint: disable=broad-except
             # Keep only the message: holding the exception/traceback would keep
             # the model referenced via stack frames and block the memory release.
             traceback.print_exc()
             error_msg = f"{type(e).__name__}: {e}"
         finally:
-            model = processor = None
+            model = processor = diarization = None
             release_gpu_memory()
 
     if error_msg is not None:
@@ -189,7 +471,203 @@ def transcribe_audio(audio_file, simple_mode, task_id, model, processor):
     progress_data[task_id] = {"stage": "completed", "progress": 100}
     return result
 
-def process_file_async(file_path, simple_mode, task_id):
+def _clean_qwen_asr_text(text):
+    """Qwen3-ASR prefixes its answer with 'language <Lang><asr_text>'; keep only the transcript."""
+    if "<asr_text>" in text:
+        text = text.split("<asr_text>", 1)[1]
+    text = re.sub(r"</?asr_text>", "", text)
+    return text.strip()
+
+
+def _ollama_transcribe_chunk(wav_path):
+    with open(wav_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("ascii")
+    payload = {
+        "model": QWEN_ASR_MODEL,
+        "messages": [{"role": "user", "content": "", "images": [audio_b64]}],
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    body = _ollama_post("/api/chat", payload, QWEN_ASR_TIMEOUT_S)
+    return _clean_qwen_asr_text(body.get("message", {}).get("content", ""))
+
+
+def transcribe_with_ollama(audio_file, simple_mode, task_id):
+    """Transcribe with Qwen3-ASR via Ollama: split into 16 kHz mono WAV chunks and send them one by one."""
+    progress_data[task_id] = {"stage": "transcribing", "progress": 40}
+    chunk_dir = tempfile.mkdtemp(prefix="qwen_asr_")
+    try:
+        command = ["ffmpeg", "-i", audio_file, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                   "-f", "segment", "-segment_time", str(QWEN_ASR_CHUNK_S),
+                   os.path.join(chunk_dir, "chunk_%05d.wav"), "-y"]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg error: {result.stderr}")
+
+        chunk_files = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.wav")))
+        if not chunk_files:
+            raise RuntimeError("No audio found in file")
+
+        chunks = []
+        offset = 0.0
+        for i, chunk_file in enumerate(chunk_files):
+            with wave.open(chunk_file, "rb") as w:
+                duration = w.getnframes() / float(w.getframerate())
+            text = _ollama_transcribe_chunk(chunk_file)
+            if text:
+                chunks.append({"timestamp": [round(offset, 2), round(offset + duration, 2)], "text": text})
+            offset += duration
+            progress_data[task_id] = {"stage": "transcribing",
+                                      "progress": 40 + int(55 * (i + 1) / len(chunk_files))}
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    progress_data[task_id] = {"stage": "completed", "progress": 100}
+    full_text = " ".join(c["text"] for c in chunks)
+    if simple_mode:
+        return {"text": full_text}
+    return {"text": full_text, "chunks": chunks}
+
+
+def _ollama_post(path, payload, timeout):
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Ollama error {e.code}: {e.read().decode('utf-8', 'replace')}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Ollama not reachable at {OLLAMA_URL}: {e.reason}") from None
+
+
+def _ollama_get(path):
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}{path}", timeout=10) as resp:
+            return json.load(resp)
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Ollama not reachable at {OLLAMA_URL}: {e}") from None
+
+
+def _estimate_tokens(text):
+    return len(text) // 3 + 1  # conservative for German
+
+
+def llm_chat(system, user, max_output_tokens=4096):
+    """Single non-streaming chat call; context size sized to the input."""
+    needed = _estimate_tokens(system) + _estimate_tokens(user) + max_output_tokens
+    num_ctx = min(LLM_MAX_CTX, max(8192, 1 << (needed - 1).bit_length()))
+    body = _ollama_post("/api/chat", {
+        "model": LLM_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.2, "num_ctx": num_ctx, "num_predict": max_output_tokens},
+    }, LLM_TIMEOUT_S)
+    text = body.get("message", {}).get("content", "")
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def _split_text(text, max_chars):
+    """Split at sentence boundaries into parts of at most ~max_chars."""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    parts, current = [], ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) + 1 > max_chars:
+            parts.append(current)
+            current = ""
+        current = f"{current} {sentence}".strip()
+    if current:
+        parts.append(current)
+    return parts
+
+
+TRANSCRIPT_NOTE = (
+    "Das Transkript stammt aus einer automatischen Spracherkennung und kann Erkennungsfehler enthalten. "
+    "Es kann Deutsch und Englisch gemischt sein. Beginnen Zeilen mit einem Sprecher (z. B. \"Sprecher 2:\" "
+    "oder einem Namen), ordne Aussagen, Zusagen und Aufgaben anhand dieser Kennzeichnung zu; sonst gibt es "
+    "keine Sprecherkennzeichnung. Verwende ausschließlich Informationen aus dem Transkript, erfinde nichts. "
+    "Antworte auf Deutsch in Markdown."
+)
+
+MINUTES_SYSTEM = (
+    "Du bist ein erfahrener Protokollführer und erstellst aus Besprechungstranskripten ein Ergebnisprotokoll. "
+    + TRANSCRIPT_NOTE + "\n\nGliederung:\n"
+    "# Protokoll: <Thema>\n"
+    "**Datum:** (nur falls genannt) · **Teilnehmende:** (nur falls erkennbar)\n"
+    "## Zusammenfassung\n(3–5 Sätze)\n"
+    "## Besprochene Themen\n(je Thema eine Zwischenüberschrift mit den wesentlichen Punkten)\n"
+    "## Entscheidungen\n"
+    "## Aufgaben\n(Tabelle: Aufgabe | Verantwortlich | Frist – unbekannt bleibt leer)\n"
+    "## Offene Fragen\n"
+    "Lasse Abschnitte ohne Inhalt weg."
+)
+
+
+def _actions_system(name):
+    if name:
+        who = (f"Liste ausschließlich die Aufgaben auf, die {name} übernehmen soll, zugesagt hat oder die {name} "
+               f"zugewiesen wurden – auch wenn {name} direkt angesprochen wird (\"kannst du …\") oder in der "
+               "Ich-Form zusagt und der Kontext auf diese Person hindeutet. Ist die Zuordnung unsicher, "
+               "kennzeichne den Punkt mit \"(Zuordnung unsicher)\".")
+    else:
+        who = "Liste alle Aufgaben auf und nenne jeweils die verantwortliche Person, falls erkennbar."
+    return (
+        "Du extrahierst Aufgaben (Action Items) aus Besprechungstranskripten. " + TRANSCRIPT_NOTE + " " + who +
+        "\n\nFormat je Aufgabe:\n- [ ] **<Aufgabe als konkrete Handlung>** — Frist: <falls genannt> — "
+        "Kontext: <kurzer Bezug zur Besprechung>\n"
+        "Gibt es keine passenden Aufgaben, antworte genau mit: \"Keine Aufgaben gefunden.\""
+    )
+
+
+def _analysis_prompt(kind, name):
+    if kind == "minutes":
+        return MINUTES_SYSTEM, "Erstelle das Protokoll zu folgendem Transkript:"
+    return _actions_system(name), "Extrahiere die Aufgaben aus folgendem Transkript:"
+
+
+def analyze_transcript(transcript, kind, name, task_id):
+    """Create meeting minutes or an action item list. Long transcripts are condensed part by part first."""
+    system, instruction = _analysis_prompt(kind, name)
+    budget_chars = (LLM_MAX_CTX - 6000) * 3
+
+    if len(transcript) > budget_chars:
+        parts = _split_text(transcript, budget_chars)
+        notes = []
+        for i, part in enumerate(parts):
+            progress_data[task_id] = {"stage": "analyzing", "progress": 10 + int(70 * i / len(parts)),
+                                      "message": f"Abschnitt {i + 1}/{len(parts)}"}
+            notes.append(llm_chat(
+                "Du fasst einen Abschnitt eines Besprechungstranskripts als ausführliche Stichpunkte zusammen: "
+                "Themen, Fakten und Zahlen, Entscheidungen, Aufgaben (mit Person und Frist, wörtlich wie genannt), "
+                "offene Fragen. " + TRANSCRIPT_NOTE,
+                f"Abschnitt {i + 1} von {len(parts)}:\n\n{part}",
+            ))
+        transcript = "\n\n".join(f"### Notizen zu Abschnitt {i + 1}\n{n}" for i, n in enumerate(notes))
+        instruction = instruction.replace("folgendem Transkript", "folgenden Notizen zu einem Transkript")
+
+    progress_data[task_id] = {"stage": "analyzing", "progress": 85}
+    return llm_chat(system, f"{instruction}\n\n{transcript}")
+
+
+def process_analysis_async(transcript, kind, name, task_id):
+    try:
+        progress_data[task_id] = {"stage": "queued", "progress": 5}
+        with gpu_lock:
+            progress_data[task_id] = {"stage": "freeing_gpu", "progress": 8}
+            unload_ollama_models(keep=LLM_MODEL)  # e.g. Qwen3-ASR still loaded from the transcription
+            progress_data[task_id] = {"stage": "analyzing", "progress": 10}
+            text = analyze_transcript(transcript, kind, name, task_id)
+        progress_data[task_id] = {"stage": "completed", "progress": 100, "result": {"kind": kind, "markdown": text}}
+    except Exception as e:  # pylint: disable=broad-except
+        traceback.print_exc()
+        progress_data[task_id] = {"stage": "error", "progress": 0, "error": f"Analyse fehlgeschlagen: {e}"}
+
+
+def process_file_async(file_path, simple_mode, task_id, engine="whisper", context=""):
     """Process file asynchronously"""
     audio_file = None
     try:
@@ -232,7 +710,15 @@ def process_file_async(file_path, simple_mode, task_id):
             extract_audio(file_path, audio_file, task_id)
 
         # Transcribe
-        result = run_transcription(audio_file, simple_mode, task_id)
+        if engine == "qwen3-asr":
+            # Share the lock with Whisper so a running Whisper job doesn't starve Ollama of GPU memory
+            progress_data[task_id] = {"stage": "queued", "progress": 35}
+            with gpu_lock:
+                progress_data[task_id] = {"stage": "freeing_gpu", "progress": 38}
+                unload_ollama_models(keep=QWEN_ASR_MODEL)  # e.g. the LLM from a previous analysis
+                result = transcribe_with_ollama(audio_file, simple_mode, task_id)
+        else:
+            result = run_transcription(audio_file, simple_mode, task_id, engine, context)
 
         # Clean up
         if audio_file and os.path.exists(audio_file) and audio_file != file_path:
@@ -293,6 +779,10 @@ def upload_file():
         return jsonify({'error': 'No file selected'}), 400
 
     simple_mode = request.form.get('simple', 'false').lower() == 'true'
+    engine = request.form.get('engine', 'whisper')
+    context = (request.form.get('context') or '').strip()[:2000]
+    if engine not in ENGINES:
+        return jsonify({'error': f'Unknown engine: {engine}'}), 400
 
     # Save uploaded file
     filename = secure_filename(file.filename)
@@ -304,10 +794,29 @@ def upload_file():
     progress_data[task_id] = {"stage": "uploaded", "progress": 5}
 
     # Start processing in background
-    thread = threading.Thread(target=process_file_async, args=(file_path, simple_mode, task_id))
+    thread = threading.Thread(target=process_file_async, args=(file_path, simple_mode, task_id, engine, context))
     thread.daemon = True
     thread.start()
 
+    return jsonify({'task_id': task_id})
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    """Start creating minutes or action items from a transcript"""
+    data = request.get_json(silent=True) or {}
+    transcript = (data.get('transcript') or '').strip()
+    kind = data.get('kind')
+    name = (data.get('name') or '').strip()[:100]
+    if not transcript:
+        return jsonify({'error': 'No transcript provided'}), 400
+    if kind not in ANALYSES:
+        return jsonify({'error': f'Unknown analysis: {kind}'}), 400
+
+    task_id = str(uuid.uuid4())
+    progress_data[task_id] = {"stage": "queued", "progress": 5}
+    thread = threading.Thread(target=process_analysis_async, args=(transcript, kind, name, task_id))
+    thread.daemon = True
+    thread.start()
     return jsonify({'task_id': task_id})
 
 @app.route('/progress/<task_id>')
@@ -555,6 +1064,77 @@ HTML_TEMPLATE = '''
             margin-top: 15px;
         }
 
+        .context-input {
+            padding: 8px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 8px;
+            font-size: 1em;
+            min-width: 320px;
+        }
+
+        .speaker {
+            font-weight: 600;
+            color: #6f42c1;
+            margin-right: 6px;
+        }
+
+        .speaker-names {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 10px 0 5px;
+        }
+
+        .speaker-names label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .speaker-names input {
+            padding: 6px 10px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            width: 160px;
+        }
+
+        .simple-transcript {
+            white-space: pre-wrap;
+        }
+
+        .analysis-section {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #dee2e6;
+        }
+
+        .analysis-controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            margin: 15px 0;
+        }
+
+        .analysis-controls input {
+            padding: 10px 14px;
+            border: 1px solid #ced4da;
+            border-radius: 8px;
+            font-size: 1em;
+            min-width: 220px;
+        }
+
+        .analysis-output {
+            white-space: pre-wrap;
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 15px 0;
+            line-height: 1.5;
+            font-family: inherit;
+        }
+
         .download-button:hover {
             transform: translateY(-1px);
             box-shadow: 0 5px 15px rgba(23, 162, 184, 0.3);
@@ -576,6 +1156,20 @@ HTML_TEMPLATE = '''
             <div id="fileInfo" class="file-info" style="display: none;"></div>
 
             <div class="options">
+                <div class="checkbox-wrapper">
+                    <label for="engine">Modell:</label>
+                    <select id="engine">
+                        <option value="whisper" selected>Whisper large-v3</option>
+                        <option value="qwen3-asr">Qwen3-ASR 1.7B (Ollama)</option>
+                        <option value="vibevoice">VibeVoice-ASR (mit Sprechererkennung)</option>
+                        <option value="whisper-pyannote">Whisper + pyannote (mit Sprechererkennung, schneller)</option>
+                    </select>
+                </div>
+                <div class="checkbox-wrapper" id="contextWrapper" style="display: none;">
+                    <label for="context">Kontext:</label>
+                    <input type="text" id="context" class="context-input"
+                           placeholder="Namen, Fachbegriffe, Thema (optional)">
+                </div>
                 <div class="checkbox-wrapper">
                     <input type="checkbox" id="simpleMode" checked>
                     <label for="simpleMode">Einfacher Modus (ohne Zeitstempel)</label>
@@ -599,6 +1193,26 @@ HTML_TEMPLATE = '''
             <button id="downloadButton" class="download-button" style="display: none;">
                 💾 Als JSON herunterladen
             </button>
+
+            <div class="analysis-section">
+                <h2>🧠 Auswertung (Ollama)</h2>
+                <div id="speakerNamesWrapper" style="display: none;">
+                    <p>Sprecher benennen (wird für Protokoll und Aufgaben verwendet):</p>
+                    <div id="speakerNames" class="speaker-names"></div>
+                </div>
+                <div class="analysis-controls">
+                    <input type="text" id="userName" placeholder="Ihr Name (für Ihre Aufgaben)">
+                    <button id="minutesButton" class="download-button">📋 Protokoll erstellen</button>
+                    <button id="actionsButton" class="download-button">✅ Meine Aufgaben</button>
+                </div>
+                <div id="analysisStatus" class="status" style="display: none;"></div>
+                <div id="analysisResult" style="display: none;">
+                    <h3 id="analysisTitle"></h3>
+                    <div id="analysisOutput" class="analysis-output"></div>
+                    <button id="analysisCopyButton" class="download-button">📄 Kopieren</button>
+                    <button id="analysisDownloadButton" class="download-button">💾 Als Markdown herunterladen</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -617,8 +1231,27 @@ HTML_TEMPLATE = '''
                 const downloadButton = document.getElementById('downloadButton');
 
                 fileInput.addEventListener('change', (e) => this.handleFileSelect(e));
+                const engine = document.getElementById('engine');
+                const toggleContext = () => {
+                    document.getElementById('contextWrapper').style.display =
+                        engine.value === 'vibevoice' ? 'flex' : 'none';
+                };
+                engine.addEventListener('change', toggleContext);
+                toggleContext();
                 processButton.addEventListener('click', () => this.processFile());
                 downloadButton.addEventListener('click', () => this.downloadResult());
+
+                const userName = document.getElementById('userName');
+                try { userName.value = localStorage.getItem('whisperUserName') || ''; } catch (e) {}
+                userName.addEventListener('change', () => {
+                    try { localStorage.setItem('whisperUserName', userName.value.trim()); } catch (e) {}
+                });
+                document.getElementById('minutesButton').addEventListener('click', () => this.runAnalysis('minutes'));
+                document.getElementById('actionsButton').addEventListener('click', () => this.runAnalysis('actions'));
+                document.getElementById('analysisCopyButton').addEventListener('click', () => {
+                    navigator.clipboard.writeText(this.analysisMarkdown || '');
+                });
+                document.getElementById('analysisDownloadButton').addEventListener('click', () => this.downloadAnalysis());
             }
 
             handleFileSelect(event) {
@@ -647,6 +1280,8 @@ HTML_TEMPLATE = '''
                 const formData = new FormData();
                 formData.append('file', this.currentFile);
                 formData.append('simple', document.getElementById('simpleMode').checked);
+                formData.append('engine', document.getElementById('engine').value);
+                formData.append('context', document.getElementById('context').value);
 
                 try {
                     this.showStatus('Upload startet...', 'processing');
@@ -692,6 +1327,8 @@ HTML_TEMPLATE = '''
                         'extracted': 'Audio extrahiert...',
                         'queued': 'Warte auf freie GPU...',
                         'loading_model': 'Modell wird geladen...',
+                        'diarizing': 'Sprecher werden erkannt...',
+                        'freeing_gpu': 'GPU-Speicher wird freigegeben (Ollama-Modelle entladen)...',
                         'transcribing': 'Transkription läuft...',
                         'completed': 'Verarbeitung abgeschlossen!',
                         'error': 'Fehler aufgetreten'
@@ -738,25 +1375,119 @@ HTML_TEMPLATE = '''
                 const container = document.getElementById('transcriptContainer');
                 const downloadButton = document.getElementById('downloadButton');
 
+                const esc = (t) => String(t).replace(/[&<>"']/g, c => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                })[c]);
                 if (this.transcriptionResult.chunks) {
                     container.innerHTML = this.transcriptionResult.chunks.map(chunk => `
                         <div class="timestamp-chunk">
                             <div class="timestamp">
                                 ${this.formatTime(chunk.timestamp[0])} - ${this.formatTime(chunk.timestamp[1])}
                             </div>
-                            <div class="text-content">${chunk.text}</div>
+                            <div class="text-content">${chunk.speaker
+                                ? `<span class="speaker" data-speaker="${esc(chunk.speaker)}">${esc(chunk.speaker)}:</span>`
+                                : ''}${esc(chunk.text)}</div>
                         </div>
                     `).join('');
                 } else {
-                    container.innerHTML = `
-                        <div class="simple-transcript">
-                            ${this.transcriptionResult.text}
-                        </div>
-                    `;
+                    container.innerHTML = `<div class="simple-transcript">${esc(this.transcriptionResult.text)}</div>`;
                 }
+
+                const speakers = this.transcriptionResult.speakers || [];
+                const namesBox = document.getElementById('speakerNames');
+                namesBox.innerHTML = speakers.map(sp => `
+                    <label>${esc(sp)} = <input type="text" data-speaker="${esc(sp)}" placeholder="Name"></label>
+                `).join('');
+                namesBox.querySelectorAll('input').forEach(input => {
+                    input.addEventListener('input', () => {
+                        container.querySelectorAll(`.speaker[data-speaker="${input.dataset.speaker}"]`)
+                            .forEach(el => el.textContent = (input.value.trim() || input.dataset.speaker) + ':');
+                    });
+                });
+                document.getElementById('speakerNamesWrapper').style.display = speakers.length ? 'block' : 'none';
 
                 results.style.display = 'block';
                 downloadButton.style.display = 'inline-block';
+            }
+
+            async runAnalysis(kind) {
+                if (!this.transcriptionResult) return;
+                const name = document.getElementById('userName').value.trim();
+                const status = document.getElementById('analysisStatus');
+                const buttons = [document.getElementById('minutesButton'), document.getElementById('actionsButton')];
+                const setStatus = (msg, type) => {
+                    status.textContent = msg;
+                    status.className = `status ${type}`;
+                    status.style.display = 'block';
+                };
+
+                buttons.forEach(b => b.disabled = true);
+                setStatus('Auswertung wird gestartet...', 'processing');
+                try {
+                    const response = await fetch('/analyze', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({transcript: this.namedTranscript(), kind, name})
+                    });
+                    const start = await response.json();
+                    if (!response.ok || start.error) throw new Error(start.error || response.statusText);
+
+                    const messages = {
+                        'queued': 'Warte auf freie GPU...',
+                        'freeing_gpu': 'GPU-Speicher wird freigegeben...',
+                        'analyzing': 'Sprachmodell arbeitet (kann einige Minuten dauern)...'
+                    };
+                    while (true) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        const data = await (await fetch(`/progress/${start.task_id}`)).json();
+                        if (data.stage === 'error' || data.error) throw new Error(data.error || 'Unbekannter Fehler');
+                        if (data.stage === 'completed') break;
+                        setStatus((messages[data.stage] || 'Verarbeitung...') +
+                                  (data.message ? ` ${data.message}` : ''), 'processing');
+                    }
+                    const result = await (await fetch(`/result/${start.task_id}`)).json();
+                    if (result.error) throw new Error(result.error);
+
+                    this.analysisMarkdown = result.markdown;
+                    this.analysisKind = kind;
+                    document.getElementById('analysisTitle').textContent =
+                        kind === 'minutes' ? 'Protokoll' : (name ? `Aufgaben für ${name}` : 'Aufgaben');
+                    document.getElementById('analysisOutput').textContent = result.markdown;
+                    document.getElementById('analysisResult').style.display = 'block';
+                    setStatus('Auswertung abgeschlossen!', 'success');
+                } catch (error) {
+                    setStatus(`Fehler: ${error.message}`, 'error');
+                } finally {
+                    buttons.forEach(b => b.disabled = false);
+                }
+            }
+
+            namedTranscript() {
+                // Replace "Sprecher N:" line prefixes with the names entered by the user
+                const names = {};
+                document.querySelectorAll('#speakerNames input').forEach(input => {
+                    if (input.value.trim()) names[input.dataset.speaker] = input.value.trim();
+                });
+                const NL = String.fromCharCode(10);
+                const text = this.transcriptionResult.text.split(NL).map(line => {
+                    const colon = line.indexOf(':');
+                    const label = colon > 0 ? line.slice(0, colon) : '';
+                    return names[label] ? names[label] + line.slice(colon) : line;
+                }).join(NL);
+                return text;
+            }
+
+            downloadAnalysis() {
+                if (!this.analysisMarkdown) return;
+                const blob = new Blob([this.analysisMarkdown], {type: 'text/markdown'});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = this.analysisKind === 'minutes' ? 'protokoll.md' : 'aufgaben.md';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
             }
 
             formatTime(seconds) {

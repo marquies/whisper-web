@@ -17,6 +17,9 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+# The CUDA build of torchcodec from the PyTorch index needs NPP libraries we do not ship;
+# audio decoding happens on the CPU anyway, so use the CPU build from PyPI
+RUN pip install --no-cache-dir --no-deps --force-reinstall --index-url https://pypi.org/simple "torchcodec==0.7.*"
 
 # Copy application code
 COPY whisper-web.py .
